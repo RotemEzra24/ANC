@@ -1,0 +1,144 @@
+#include <SPI.h>
+
+// ================= פינים =================
+const int CS[4]  = {5, 19, 21, 22};      // MCP41010 U21..U24
+const int ADC[4] = {34, 35, 32, 33};     // מיקרופונים 1..4
+#define ADC_ERR  36                       // מיקרופון שגיאה (VP)
+
+// ================= פרמטרים =================
+#define GAIN_BASE    180     // גיין התחלתי
+#define GAIN_MAX     220     // תקרה
+#define GAIN_STEP    3       // צעד hill-climb
+#define ERR_ALPHA    0.25    // החלקת שגיאה
+#define FB_RATIO     2.0     // פידבק = קפיצה פי 2 מהממוצע המהיר
+#define FB_MUTE_MS   2000    // השתקה
+#define RAMP_STEP    5       // קצב חזרה
+#define UPDATE_MS    150
+#define FAST_ALPHA   0.3
+#define SETTLE_MS    5000    // התייצבות עם המערכת דולקת
+
+// ================= מצב =================
+float chFast[4]   = {0,0,0,0};
+int   lastSent[4] = {-1,-1,-1,-1};
+unsigned long muteUntil[4] = {0,0,0,0};
+int   chGain[4]   = {0,0,0,0};
+int   gainGlobal  = 0;
+int   direction   = +1;
+float errSmooth   = 0, errPrev = 0;
+bool  armed       = false;
+bool  protectOn   = true;
+
+// ================= SPI =================
+void setGain(int ch, int val) {
+  val = constrain(val, 0, 255);
+  if (val == lastSent[ch]) return;
+  digitalWrite(CS[ch], LOW);
+  delayMicroseconds(10);
+  SPI.transfer(0x11);
+  SPI.transfer(255 - val);                // שבבים הפוכים
+  delayMicroseconds(10);
+  digitalWrite(CS[ch], HIGH);
+  lastSent[ch] = val;
+}
+
+// ================= משרעת =================
+int amp(int pin) {
+  int mn = 4095, mx = 0;
+  for (int i = 0; i < 100; i++) {
+    int v = analogRead(pin);
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    delayMicroseconds(60);
+  }
+  return mx - mn;
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  for (int i = 0; i < 4; i++) { pinMode(CS[i], OUTPUT); digitalWrite(CS[i], HIGH); }
+  delay(100);
+  SPI.begin(18, -1, 23, -1);
+  SPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+  delay(100);
+  for (int i = 0; i < 4; i++) setGain(i, 0);
+
+  // שלב 1: עולה לגיין עבודה בהדרגה
+  for (int g = 0; g <= GAIN_BASE; g += RAMP_STEP) {
+    for (int i = 0; i < 4; i++) setGain(i, g);
+    delay(60);
+  }
+  gainGlobal = GAIN_BASE;
+  for (int i = 0; i < 4; i++) chGain[i] = GAIN_BASE;
+
+  // שלב 2: רקע נמדד כשהמערכת דולקת
+  unsigned long t0 = millis();
+  while (millis() - t0 < SETTLE_MS) {
+    for (int i = 0; i < 4; i++) {
+      int a = amp(ADC[i]);
+      chFast[i] = (chFast[i] == 0) ? a : chFast[i] * 0.9 + a * 0.1;
+    }
+    int e = amp(ADC_ERR);
+    errSmooth = (errSmooth == 0) ? e : errSmooth * 0.9 + e * 0.1;
+  }
+  errPrev = errSmooth;
+  armed = true;
+}
+
+// ================= LOOP =================
+void loop() {
+  unsigned long now = millis();
+  int a[4];
+
+  // ---- 1. מיקרופונים + הגנת פידבק ----
+  for (int i = 0; i < 4; i++) {
+    a[i] = amp(ADC[i]);
+
+    if (protectOn && armed && a[i] > chFast[i] * FB_RATIO && now > muteUntil[i]) {
+      muteUntil[i] = now + FB_MUTE_MS;
+      chGain[i] = 0;
+    }
+
+    // הממוצע מתעדכן רק בגיין מלא — לא בהשתקה, לא בחזרה
+    if (now > muteUntil[i] && chGain[i] >= gainGlobal)
+      chFast[i] = chFast[i] * (1.0 - FAST_ALPHA) + a[i] * FAST_ALPHA;
+  }
+
+  // ---- 2. שגיאה → גיין משותף ----
+  int e = amp(ADC_ERR);
+  errSmooth = errSmooth * (1.0 - ERR_ALPHA) + e * ERR_ALPHA;
+  if (errSmooth > errPrev * 1.02) direction = -direction;
+  errPrev = errSmooth;
+  gainGlobal = constrain(gainGlobal + direction * GAIN_STEP, 0, GAIN_MAX);
+
+  // ---- 3. שליחה ----
+  for (int i = 0; i < 4; i++) {
+    if (now < muteUntil[i])            chGain[i] = 0;
+    else if (chGain[i] < gainGlobal)   chGain[i] = min(chGain[i] + RAMP_STEP, gainGlobal);
+    else                               chGain[i] = gainGlobal;
+    setGain(i, chGain[i]);
+  }
+
+  // ---- 4. פלט ל-Plotter ----
+  for (int i = 0; i < 4; i++) {
+    Serial.print("a"); Serial.print(i+1); Serial.print(":"); Serial.print(a[i]); Serial.print(",");
+  }
+  for (int i = 0; i < 4; i++) {
+    Serial.print("g"); Serial.print(i+1); Serial.print(":"); Serial.print(chGain[i]); Serial.print(",");
+  }
+  Serial.print("err:"); Serial.print((int)errSmooth);
+  Serial.print(",G:");  Serial.println(gainGlobal);
+
+  // ---- 5. פקודה: 'p' = הגנה on/off ----
+  if (Serial.available()) {
+    char c = Serial.read();
+    while (Serial.available()) Serial.read();
+    if (c == 'p') {
+      protectOn = !protectOn;
+      if (protectOn) for (int i = 0; i < 4; i++) muteUntil[i] = 0;
+    }
+  }
+
+  delay(UPDATE_MS);
+}
