@@ -1,23 +1,23 @@
 #include <SPI.h>
 
-// ================= פינים =================
-const int CS[4]  = {5, 19, 21, 22};      // MCP41010 U21..U24
-const int ADC[4] = {34, 35, 32, 33};     // מיקרופונים 1..4
-#define ADC_ERR  36                       // מיקרופון שגיאה (VP)
+// Pins
+const int CS[4]  = {5, 19, 21, 22};      // MCP41010 chip selects, ch1-ch4
+const int ADC[4] = {34, 35, 32, 33};     // reference mics, ch1-ch4
+#define ADC_ERR  36                       // error mic (VP)
 
-// ================= פרמטרים =================
-#define GAIN_BASE    180     // גיין התחלתי
-#define GAIN_MAX     220     // תקרה
-#define GAIN_STEP    3       // צעד hill-climb
-#define ERR_ALPHA    0.25    // החלקת שגיאה
-#define FB_RATIO     2.0     // פידבק = קפיצה פי 2 מהממוצע המהיר
-#define FB_MUTE_MS   2000    // השתקה
-#define RAMP_STEP    5       // קצב חזרה
+// Parameters
+#define GAIN_BASE    180     // starting gain
+#define GAIN_MAX     220     // gain ceiling
+#define GAIN_STEP    3       // hill-climb step
+#define ERR_ALPHA    0.25    // error smoothing
+#define FB_RATIO     2.0     // feedback = 2x jump over running average
+#define FB_MUTE_MS   2000    // mute time after feedback
+#define RAMP_STEP    5       // ramp back speed
 #define UPDATE_MS    150
 #define FAST_ALPHA   0.3
-#define SETTLE_MS    5000    // התייצבות עם המערכת דולקת
+#define SETTLE_MS    5000    // baseline measurement with system on
 
-// ================= מצב =================
+// State
 float chFast[4]   = {0,0,0,0};
 int   lastSent[4] = {-1,-1,-1,-1};
 unsigned long muteUntil[4] = {0,0,0,0};
@@ -28,20 +28,20 @@ float errSmooth   = 0, errPrev = 0;
 bool  armed       = false;
 bool  protectOn   = true;
 
-// ================= SPI =================
+// Write gain to one pot, only if the value changed
 void setGain(int ch, int val) {
   val = constrain(val, 0, 255);
   if (val == lastSent[ch]) return;
   digitalWrite(CS[ch], LOW);
   delayMicroseconds(10);
   SPI.transfer(0x11);
-  SPI.transfer(255 - val);                // שבבים הפוכים
+  SPI.transfer(255 - val);                // pots are wired inverted
   delayMicroseconds(10);
   digitalWrite(CS[ch], HIGH);
   lastSent[ch] = val;
 }
 
-// ================= משרעת =================
+// Peak to peak amplitude over 100 samples
 int amp(int pin) {
   int mn = 4095, mx = 0;
   for (int i = 0; i < 100; i++) {
@@ -53,7 +53,6 @@ int amp(int pin) {
   return mx - mn;
 }
 
-// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
@@ -64,7 +63,7 @@ void setup() {
   delay(100);
   for (int i = 0; i < 4; i++) setGain(i, 0);
 
-  // שלב 1: עולה לגיין עבודה בהדרגה
+  // Ramp up to working gain
   for (int g = 0; g <= GAIN_BASE; g += RAMP_STEP) {
     for (int i = 0; i < 4; i++) setGain(i, g);
     delay(60);
@@ -72,7 +71,7 @@ void setup() {
   gainGlobal = GAIN_BASE;
   for (int i = 0; i < 4; i++) chGain[i] = GAIN_BASE;
 
-  // שלב 2: רקע נמדד כשהמערכת דולקת
+  // Measure baseline while the system is running
   unsigned long t0 = millis();
   while (millis() - t0 < SETTLE_MS) {
     for (int i = 0; i < 4; i++) {
@@ -86,12 +85,11 @@ void setup() {
   armed = true;
 }
 
-// ================= LOOP =================
 void loop() {
   unsigned long now = millis();
   int a[4];
 
-  // ---- 1. מיקרופונים + הגנת פידבק ----
+  // Read mics and check for feedback on each channel
   for (int i = 0; i < 4; i++) {
     a[i] = amp(ADC[i]);
 
@@ -100,19 +98,19 @@ void loop() {
       chGain[i] = 0;
     }
 
-    // הממוצע מתעדכן רק בגיין מלא — לא בהשתקה, לא בחזרה
+    // Update average only at full gain, not while muted or ramping
     if (now > muteUntil[i] && chGain[i] >= gainGlobal)
       chFast[i] = chFast[i] * (1.0 - FAST_ALPHA) + a[i] * FAST_ALPHA;
   }
 
-  // ---- 2. שגיאה → גיין משותף ----
+  // Hill-climb on shared gain using the error mic
   int e = amp(ADC_ERR);
   errSmooth = errSmooth * (1.0 - ERR_ALPHA) + e * ERR_ALPHA;
   if (errSmooth > errPrev * 1.02) direction = -direction;
   errPrev = errSmooth;
   gainGlobal = constrain(gainGlobal + direction * GAIN_STEP, 0, GAIN_MAX);
 
-  // ---- 3. שליחה ----
+  // Apply gain per channel (mute, ramp back, or follow shared gain)
   for (int i = 0; i < 4; i++) {
     if (now < muteUntil[i])            chGain[i] = 0;
     else if (chGain[i] < gainGlobal)   chGain[i] = min(chGain[i] + RAMP_STEP, gainGlobal);
@@ -120,7 +118,7 @@ void loop() {
     setGain(i, chGain[i]);
   }
 
-  // ---- 4. פלט ל-Plotter ----
+  // Serial Plotter output
   for (int i = 0; i < 4; i++) {
     Serial.print("a"); Serial.print(i+1); Serial.print(":"); Serial.print(a[i]); Serial.print(",");
   }
@@ -130,7 +128,7 @@ void loop() {
   Serial.print("err:"); Serial.print((int)errSmooth);
   Serial.print(",G:");  Serial.println(gainGlobal);
 
-  // ---- 5. פקודה: 'p' = הגנה on/off ----
+  // Send 'p' to toggle feedback protection
   if (Serial.available()) {
     char c = Serial.read();
     while (Serial.available()) Serial.read();
